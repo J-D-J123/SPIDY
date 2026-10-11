@@ -2,6 +2,7 @@ import hmac
 import json
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -100,10 +101,36 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
             state["task"] = {**task, "status": "error", "error": error, "ended": now()} if error else None
             store.update(scan_id, autopilot=state)
 
+    def make_progress(scan_id, task_id):
+        """Stream the models' real output into the task marker for the dashboard to poll."""
+        last = [0.0]
+
+        def progress(field, text):
+            # Throttle the token stream so we don't write to disk on every chunk; always flush
+            # the final guide text and stage changes immediately.
+            if field == "guide_text" and (time.monotonic() - last[0]) < 0.3:
+                return
+            last[0] = time.monotonic()
+            with store.lock:
+                scan = store.get(scan_id)
+                state = scan.get("autopilot") or {}
+                task = state.get("task") or {}
+                if task.get("id") != task_id:
+                    return
+                if field in ("guide_text", "guide_final"):
+                    task["guide_text"] = str(text)[-1600:]
+                    if field == "guide_final":
+                        task["stage"] = "exec"
+                elif field == "stage":
+                    task["stage"] = str(text)
+                state["task"] = task
+                store.update(scan_id, autopilot=state)
+        return progress
+
     def run_autopilot_task(scan_id, body, task_id):
         """Do the slow work (LLM planning or tool/command execution) off the request thread."""
         try:
-            agent.autopilot_action(store, scan_id, body)
+            agent.autopilot_action(store, scan_id, body, progress=make_progress(scan_id, task_id))
             settle_autopilot_task(scan_id, task_id, None)
         except (llm.LLMError, externals.ToolError, ValueError) as exc:
             settle_autopilot_task(scan_id, task_id, str(exc))
@@ -135,6 +162,12 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
             kind = "run" if action == "run" else "plan"
             state.setdefault("steps", [])
             state["task"] = {"id": task_id, "kind": kind, "status": "running", "started": now()}
+            if kind == "plan":
+                # The guide speaks first (only when it is a different model), then the executor responds.
+                g = body.get("guide_model", state.get("guide_model")) or ""
+                m = body.get("model") or state.get("model") or ""
+                state["task"]["stage"] = "guide" if (g and g != m) else "exec"
+                state["task"]["guide_text"] = ""
             store.update(scan_id, autopilot=state)
             worker = threading.Thread(target=run_autopilot_task, args=(scan_id, body, task_id), daemon=True)
             with autopilot_workers_lock:

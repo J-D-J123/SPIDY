@@ -103,17 +103,63 @@ def available(host=DEFAULT_HOST):
         return False
 
 
-def generate(model, prompt, system="", host=DEFAULT_HOST, num_predict=400, temperature=0.1, response_format=None):
-    """Single-shot local-model completion, used by the model-driven planner."""
+def generate(model, prompt, system="", host=DEFAULT_HOST, num_predict=400, temperature=0.1, response_format=None, on_token=None):
+    """Single-shot local-model completion. With on_token, stream real output as it is produced.
+
+    on_token(accumulated_text) is called as each chunk arrives, so the UI can show the model's
+    actual words live instead of a fabricated placeholder.
+    """
     if not isinstance(model, str) or not _MODEL_NAME.fullmatch(model):
         raise LLMError("Choose a valid installed model name.")
-    payload = {"model": model, "system": system, "prompt": prompt, "stream": False,
-               "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": 16384}}
+    options = {"temperature": temperature, "num_predict": num_predict, "num_ctx": 16384}
+    payload = {"model": model, "system": system, "prompt": prompt, "stream": bool(on_token), "options": options}
     if response_format is not None:
         payload["format"] = response_format
+    if on_token:
+        return _generate_stream(host, payload, on_token)
     data = _request(host, "/api/generate", payload)
     text = data.get("response")
     if not isinstance(text, str):
+        raise LLMError("The model returned an empty response.")
+    return text
+
+
+def _generate_stream(host, payload, on_token):
+    """POST with stream=true and feed Ollama's NDJSON chunks to on_token as they arrive."""
+    url = _valid_host(host) + "/api/generate"
+    request = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"})
+    pieces, total = [], 0
+    try:
+        with urllib.request.urlopen(request, timeout=GENERATE_TIMEOUT) as response:
+            if response.status != 200:
+                raise LLMError(f"Ollama returned HTTP {response.status}.")
+            for line in response:
+                line = line.strip()
+                if not line:
+                    continue
+                total += len(line)
+                if total > MAX_RESPONSE_BYTES:
+                    raise LLMError("Ollama response was too large.")
+                try:
+                    obj = json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                chunk = obj.get("response")
+                if isinstance(chunk, str) and chunk:
+                    pieces.append(chunk)
+                    try:
+                        on_token("".join(pieces))
+                    except Exception:  # noqa: BLE001 - a UI callback must never break generation
+                        pass
+                if obj.get("done"):
+                    break
+    except urllib.error.HTTPError as exc:
+        raise LLMError(f"Ollama returned HTTP {exc.code}." + (" Has that model been pulled?" if exc.code == 404 else ""))
+    except (urllib.error.URLError, OSError, TimeoutError):
+        raise LLMError("Could not reach a local Ollama server. Start it with `ollama serve` and pull a model.")
+    text = "".join(pieces)
+    if not text.strip():
         raise LLMError("The model returned an empty response.")
     return text
 

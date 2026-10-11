@@ -650,6 +650,57 @@ class AutopilotTests(unittest.TestCase):
             agent.propose_next(scan, "local", None, history)
         self.assertIn("your last command FAILED", generate.call_args.args[1])
 
+    def test_botched_no_option_tool_command_runs_via_correct_builtin(self):
+        from spidy import agent
+        # The exact invented-flag commands the executor kept failing on become the correct adapter call.
+        for cmd, tool in [("gau --rate=100 --target https://t.test/", "gau"),
+                          ("httpx --rate=100 --reason", "httpx"),
+                          ("nikto -z https://t.test/", "nikto")]:
+            proposal, issue = agent._normalize_reply(json.dumps({"action": "run", "command": cmd, "reason": "x"}))
+            self.assertIsNone(issue)
+            self.assertEqual(proposal["tool"], tool)
+            self.assertEqual(proposal["options"], {})
+            self.assertIn("built-in", proposal["preparation_note"])
+            self.assertNotIn("command", proposal)  # it is a tool call now, not a raw command
+        # A no-option tool run as the correct adapter is NOT blocked as a repeat of the failed raw command.
+        from spidy.action_memory import repeated_steps
+        failed = [{"outcome": "ran", "command": "gau --rate=100 --target https://t.test/", "meta": {"exit_code": 2}}]
+        self.assertEqual(repeated_steps({"tool": "gau", "options": {}}, failed, "https://t.test/"), [])
+        # Tools with real options and shell pipelines are left as the author wrote them.
+        self.assertEqual(agent._normalize_reply('{"action":"run","command":"nuclei -u https://t.test/ -severity high"}')[0]["command"],
+                         "nuclei -u https://t.test/ -severity high")
+        self.assertEqual(agent._normalize_reply('{"action":"run","command":"gau t.test | tee out.txt"}')[0]["command"],
+                         "gau t.test | tee out.txt")
+
+    def test_tool_option_keys_are_normalized_to_the_adapter_schema(self):
+        from spidy import agent, externals
+        from spidy.action_memory import repeated_steps
+        wl = externals.TOOLS["ffuf"]["options"]["wordlist"]
+        # Invented ffuf keys (u/e/w/rate) map to real options; unknown keys and the target are dropped.
+        p, _ = agent._normalize_reply(json.dumps({"action": "run", "tool": "ffuf",
+                                                   "options": {"u": "https://t.test/FUZZ", "e": ".html,.css", "w": wl, "rate": "1000"}}))
+        self.assertEqual(p["options"], {"extensions": ".html,.css", "wordlist": wl})
+        # With real option values, an equivalent prior ffuf run is now caught as a repeat.
+        hist = [{"outcome": "ran", "tool": "ffuf", "options": {"extensions": ".html,.css"}}]
+        self.assertEqual(repeated_steps(p, hist, "https://t.test/"), [1])
+        self.assertEqual(agent._normalize_reply('{"action":"run","tool":"nuclei","options":{"sev":"high","bogus":"1"}}')[0]["options"],
+                         {"severity": "high"})
+
+    def test_guide_directive_feeds_authoritative_usage_and_failures(self):
+        from spidy import agent
+        history = [{"outcome": "ran", "command": "gau --rate=100 --target https://t.test/", "meta": {"exit_code": 2, "output": "unknown flag"}}]
+        scan = self.store.get(self.scan["id"])
+        with patch("spidy.agent.llm.generate", return_value="* use the built-in gau shortcut") as generate:
+            directive = agent._guide_directive(scan, "big-guide", None, history)
+        prompt = generate.call_args.args[1]
+        self.assertIn("AUTHORITATIVE correct command usage", prompt)
+        self.assertIn("gau DOMAIN", prompt)                       # correct usage is supplied to the guide
+        self.assertIn("ALREADY FAILED", prompt)
+        self.assertIn("gau --rate=100 --target", prompt)          # the failed command is named
+        self.assertEqual(directive, "* use the built-in gau shortcut")
+        # No guide model configured → no guide call, empty directive.
+        self.assertEqual(agent._guide_directive(scan, "", None, history), "")
+
     def test_preparing_pending_draft_does_not_execute_or_reuse_approval(self):
         from spidy import agent
         old = self.plan({"action": "manual", "instructions": "Check local version"})

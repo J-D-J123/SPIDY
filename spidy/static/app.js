@@ -91,7 +91,7 @@ function scheduleRefresh() {
       const task = current.autopilot?.task;
       if (prevTask?.status === "running" && task?.status !== "running") autopilotSettled(prevTask);
     } catch (e) { showError("#connection-error", e); scheduleRefresh(); }
-  }, 1200);
+  }, autopilotTaskRunning() ? 600 : 1200);  // poll faster while a task streams its output
 }
 function render() {
   const s = current, running = ["queued", "running"].includes(s.status);
@@ -367,6 +367,74 @@ async function renderTools() {
     row.append(run, status); card.append(row); container.append(card);
   });
 }
+function stepOutcome(st) {
+  let outcome = st.outcome || st.status || "step";
+  if (outcome === "ran" && st.meta?.timed_out) return "timed out";
+  if (outcome === "ran" && st.meta?.exit_code != null && st.meta.exit_code !== 0) return "failed";
+  return outcome;
+}
+function stepNode(st, index, open) {
+  const line = node("div", "autopilot-step");
+  const name = st.command ? "custom command" : st.tool || "manual step";
+  const outcome = stepOutcome(st);
+  const result = outcome === "ran" ? (st.command ? " · output saved" : st.added !== undefined ? ` → +${st.added} finding(s)` : "") : "";
+  line.append(node("strong", "", `${index ? "#" + index + " · " : ""}${outcome} · ${name}${result}`));
+  if (st.command) line.append(node("pre", "command-output", st.command));
+  else if (Object.keys(st.options || {}).length) line.append(node("pre", "command-output", `${st.tool} ${JSON.stringify(st.options)}`));
+  if (st.reason) line.append(node("div", "small muted", st.reason));
+  if (st.error) line.append(node("div", "notice error", st.error));
+  if (st.meta?.output !== undefined) {
+    const details = node("details"); if (open) details.open = true;
+    details.append(node("summary", "", `Output · exit ${st.meta.exit_code}${st.meta.timed_out ? " · timed out" : ""}${st.meta.output_truncated ? " · truncated" : ""}`),
+                   node("pre", "command-output", st.meta.output || "(no output)"));
+    line.append(details);
+  }
+  return line;
+}
+function typingDots() {
+  // A neutral "typing…" indicator — never fabricated words, just shows a turn is in progress.
+  const t = node("span", "typing"); t.append(node("span"), node("span"), node("span")); return t;
+}
+function chatBubbleEl(kind, who, textOrNode) {
+  const b = node("div", "chat-msg " + kind);
+  const body = node("span", "chat-text");
+  if (typeof textOrNode === "string") body.textContent = textOrNode; else body.append(textOrNode);
+  b.append(node("span", "chat-who", who), body);
+  return b;
+}
+function autopilotFeed(plan, working, runningStep) {
+  // A turn-based feed of the models' REAL words: the guide speaks, the executor then responds.
+  const feed = node("div", "autopilot-feed"); let any = false;
+  const add = el => { feed.append(el); any = true; };
+  const task = plan.task || {};
+  if (working && task.kind === "plan") {
+    const stage = task.stage || "exec";
+    if (stage === "guide" || task.guide_text) {
+      // Guide's turn: show its real streamed words; dots until the first tokens arrive.
+      add(chatBubbleEl("guide", "Guide", task.guide_text ? task.guide_text : typingDots()));
+    }
+    if (stage === "exec") {
+      // Guide has finished (or there is none) — executor is now responding. Its real words
+      // appear as the proposal when ready; until then, a plain typing indicator.
+      add(chatBubbleEl("exec", "Executor", typingDots()));
+    }
+  } else if (runningStep) {
+    // Not reasoning here — just state the actual command being executed.
+    add(chatBubbleEl("exec", "Executor", "Running " + (runningStep.command || `${runningStep.tool} ${JSON.stringify(runningStep.options || {})}`) + "…"));
+  } else {
+    const p = plan.proposal;
+    if (p) {
+      if (p.guidance) add(chatBubbleEl("guide", "Guide", p.guidance));   // the guide's real output
+      if (["done", "stop", "paused"].includes(p.action)) add(chatBubbleEl("exec", "Executor", p.reason || "No further steps to propose."));
+      else {
+        const what = p.command !== undefined ? (p.command || "(needs a runnable command)")
+          : p.tool ? `${p.tool} ${JSON.stringify(p.options || {})}` : (p.instructions || "a manual step");
+        add(chatBubbleEl("exec", "Executor", (p.reason ? p.reason + " " : "") + "→ proposing: " + what));  // the executor's real words
+      }
+    }
+  }
+  return any ? feed : null;
+}
 function renderAutopilot() {
   loadModels();
   const steps = $("#autopilot-steps"); if (!steps) return;
@@ -374,36 +442,29 @@ function renderAutopilot() {
   const working = autopilotTaskRunning();
   $("#autopilot-plan").disabled = !finished || working;
   steps.replaceChildren();
-  const plan = current.autopilot;
-  if (plan?.steps?.length) {
-    steps.append(node("p", "small muted", `History · ${plan.steps.length} step(s)`));
-    plan.steps.forEach(st => {
-      const line = node("div", "autopilot-step");
-      const name = st.command ? "custom command" : st.tool || "manual step";
-      let outcome = st.outcome || st.status || "step";
-      if (outcome === "ran" && st.meta?.timed_out) outcome = "timed_out";
-      else if (outcome === "ran" && st.meta?.exit_code != null && st.meta.exit_code !== 0) outcome = "failed";
-      const result = outcome === "ran" ? (st.command ? " · output saved for review" : st.added !== undefined ? ` → +${st.added} finding(s)` : "") : "";
-      line.append(node("strong", "", `${outcome} · ${name}${result}`));
-      if (st.command) line.append(node("pre", "command-output", st.command));
-      else if (Object.keys(st.options || {}).length) line.append(node("pre", "command-output", JSON.stringify(st.options)));
-      if (st.reason) line.append(node("div", "small muted", st.reason));
-      if (st.error) line.append(node("div", "notice error", st.error));
-      if (st.meta?.output !== undefined) {
-        const details = node("details");
-        details.append(node("summary", "", `Output · exit ${st.meta.exit_code}${st.meta.timed_out ? " · timed out" : ""}${st.meta.output_truncated ? " · truncated" : ""}`), node("pre", "command-output", st.meta.output || "(no output)"));
-        line.append(details);
-      }
-      steps.append(line);
-    });
+  const plan = current.autopilot || {};
+  const allSteps = plan.steps || [];
+  const runningStep = (working && plan.task?.kind === "run") ? allSteps[allSteps.length - 1] : null;
+
+  const feed = autopilotFeed(plan, working, runningStep);
+  if (feed) steps.append(feed);
+
+  // Show the command running right now in full, so you can see what's happening.
+  if (runningStep) { const live = node("div", "autopilot-live"); live.append(stepNode(runningStep, allSteps.length, true)); steps.append(live); }
+
+  // Everything else is hidden in a collapsed log, most-recent first, so you can always come back to it.
+  const past = runningStep ? allSteps.slice(0, -1) : allSteps;
+  if (past.length) {
+    const det = node("details", "step-history");
+    det.append(node("summary", "", `Previous steps (${past.length}) — newest first`));
+    const list = node("div", "step-list");
+    past.forEach((st, i) => list.append(stepNode(st, i + 1)));
+    list.replaceChildren(...[...list.children].reverse());
+    det.append(list); steps.append(det);
   }
-  if (working) {
-    $("#autopilot-proposal").replaceChildren(node("p", "small muted",
-      plan.task.kind === "run" ? "Running the approved action… this can take a while. You can leave this tab open."
-                               : "The model is deciding the next step… this can take a while. You can leave this tab open."));
-    return;
-  }
-  renderProposal(plan?.proposal);
+
+  if (working) { $("#autopilot-proposal").replaceChildren(); return; }
+  renderProposal(plan.proposal);
 }
 function autopilotSettled(prevTask) {
   const plan = current.autopilot || {};
@@ -428,8 +489,7 @@ function renderProposal(p) {
   const box = $("#autopilot-proposal"); box.replaceChildren();
   if (!p) return;
   if (["done", "stop", "paused"].includes(p.action)) {
-    box.append(node("p", "", p.reason || "The model has no further steps to propose."));
-    if (p.guidance) { const g = node("details", "guidance"); g.append(node("summary", "", "Lead analyst guidance"), node("pre", "command-output", p.guidance)); box.append(g); }
+    box.append(node("p", "small muted", p.reason || "The model has no further steps to propose."));
     return;
   }
   const scanId = current.id;
@@ -437,7 +497,6 @@ function renderProposal(p) {
   const card = node("div", "proposal-card");
   card.append(node("strong", "", custom ? "Proposed action — review before approving" : `Proposed: run ${p.tool} — approve before it executes`));
   if (p.reason && !p.reason.includes("Supply a command below")) card.append(node("p", "small", p.reason));
-  if (p.guidance) { const g = node("details", "guidance"); g.append(node("summary", "", "Lead analyst guidance"), node("pre", "command-output", p.guidance)); card.append(g); }
   if (p.repeat_note) card.append(node("p", "notice", p.repeat_note));
   if (p.preparation_note) card.append(node("p", "small", p.preparation_note));
   if (p.instructions && p.action === "manual") card.append(node("pre", "command-output", p.instructions));
@@ -516,12 +575,27 @@ async function autopilotPlan(proposalId = null) {
   } catch (e) { if (current?.id === scanId) { $("#autopilot-status").textContent = e.message; renderAutopilot(); } }
 }
 $("#autopilot-plan").addEventListener("click", () => autopilotPlan());
+$("#autopilot-guide-model")?.addEventListener("change", guideHint);
 let llmModelsLoaded = false;
 function optionNode(value, label) { const o = node("option", "", label); o.value = value; return o; }
 function pickDefaultModel(models) {
   // Prefer a genuinely unrestricted/uncensored model by name; else the first installed one.
   const unrestricted = /uncensor|dolphin|abliterat|storm|wizard|hermes|nous|mytho|airoboros|tiger|solar/i;
   return models.find(name => unrestricted.test(name)) || models[0];
+}
+// Uncensored models worth running as the guide; offered even when not yet pulled.
+const RECOMMENDED_GUIDES = [
+  {name: "dolphin-mistral", note: "uncensored · 7B · 32K ctx"},
+  {name: "dolphin-mixtral:8x7b", note: "uncensored · bigger, stronger"},
+  {name: "dolphin3:8b", note: "uncensored · newer (Llama 3.1)"},
+];
+let installedModels = new Set();
+function guideHint() {
+  const el = $("#autopilot-guide-hint"); if (!el) return;
+  const sel = $("#autopilot-guide-model"); const v = sel?.value || "";
+  if (v && !installedModels.has(v)) {
+    el.textContent = `${v} isn't pulled yet — run:  ollama pull ${v}  (then click ↻ refresh). Until then the executor plans alone.`;
+  } else el.textContent = "";
 }
 async function loadModels(force) {
   if (llmModelsLoaded && !force) return;
@@ -543,14 +617,21 @@ async function loadModels(force) {
     // (the detailed list is largest-first), else the largest overall, never the executor itself.
     const guide = $("#autopilot-guide-model");
     if (guide) {
+      const installed = new Set(info.models); installedModels = installed;
       guide.replaceChildren(optionNode("", "None (executor only)"));
       info.models.forEach(n => guide.append(optionNode(n, n)));
+      // Recommended uncensored guides you can pull — shown as choices even before they're installed.
+      RECOMMENDED_GUIDES.forEach(r => {
+        if (!installed.has(r.name)) {
+          const o = optionNode(r.name, `${r.name} — ${r.note} · not installed`);
+          o.dataset.pull = "1"; guide.append(o);
+        }
+      });
       const detailed = (info.detailed || []).filter(m => m.name !== chosen);
       const uncensored = /uncensor|dolphin|abliterat|storm|wizard|hermes|nous|mytho|airoboros|tiger|solar/i;
       const pick = detailed.find(m => uncensored.test(m.name)) || detailed[0];
       if (pick && info.models.length > 1) guide.value = pick.name;
-      if (status && pick && info.models.length > 1 && !info.detailed.some(m => uncensored.test(m.name) && m.name !== chosen))
-        status.textContent = `Tip: for a stronger uncensored guide, pull one — e.g. ollama pull dolphin-llama3:8b. `;
+      guideHint();
     }
     if (status) status.textContent = (status.textContent || "") + `${info.models.length} local model(s) found. Will analyze with: ${chosen}.`;
   } else {

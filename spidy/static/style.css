@@ -256,3 +256,16 @@ dialog::backdrop{background:rgba(255,255,255,.4)}
 .proposal-card{border:1px solid var(--blue,#2f5f9e);border-radius:7px;padding:14px;margin:12px 0;background:rgba(47,95,158,0.04)}.proposal-card>strong{font-size:13px}
 
 .command-output{white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto;font:12px monospace}
+.autopilot-feed{display:flex;flex-direction:column;gap:4px;max-height:190px;overflow-y:auto;margin:8px 0;padding:8px 10px;background:#f6f8fa;border:1px solid var(--soft-line);border-radius:5px;font-size:11px;line-height:1.4}
+.chat-msg{display:flex;gap:7px;align-items:baseline}
+.chat-who{flex:0 0 56px;font-weight:bold;text-align:right}
+.chat-msg.guide .chat-who{color:#2f8f4e}
+.chat-msg.exec .chat-who{color:var(--blue,#2f5f9e)}
+.chat-text{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text)}
+.autopilot-live{margin:8px 0;padding:8px 10px;border:1px solid var(--blue,#2f5f9e);border-radius:5px;background:rgba(47,95,158,0.04)}
+.step-history{margin-top:10px}.step-history>summary{font-size:11px;color:var(--muted);cursor:pointer}
+.step-list{display:flex;flex-direction:column;margin-top:4px}
+.typing{display:inline-flex;gap:3px;align-items:center;height:12px}
+.typing span{width:5px;height:5px;border-radius:50%;background:var(--muted);opacity:.4;animation:typing-bounce 1.2s infinite}
+.typing span:nth-child(2){animation-delay:.2s}.typing span:nth-child(3){animation-delay:.4s}
+@keyframes typing-bounce{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:.9;transform:translateY(-3px)}}

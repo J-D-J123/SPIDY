@@ -91,6 +91,26 @@ _TOOL_USAGE = {
     "gau": "gau DOMAIN  (positional domain only; no --target/--rate)",
 }
 
+# Tools whose built-in adapter takes no options: a hand-written command for one of these can only
+# add wrong flags (the model keeps inventing --target/--rate/-z), so we run the correct adapter instead.
+_NO_OPTION_TOOLS = {name for name, spec in externals.TOOLS.items() if not spec.get("options")}
+
+# Map the CLI-flag names models reach for onto Spidy's adapter option keys.
+_OPTION_ALIASES = {"e": "extensions", "exts": "extensions", "extension": "extensions", "x": "extensions",
+                   "w": "wordlist", "wl": "wordlist", "p": "ports", "port": "ports", "d": "depth",
+                   "sev": "severity", "tag": "tags", "r": "rate"}
+
+
+def _normalize_options(tool, options):
+    """Return only the options the tool's adapter defines, mapping common flag-name aliases; drop the rest."""
+    schema = externals.TOOLS[tool]["options"]
+    normalized = {}
+    for key, value in options.items():
+        canonical = key if key in schema else _OPTION_ALIASES.get(key.lstrip("-"), "")
+        if canonical in schema:
+            normalized[canonical] = value
+    return normalized
+
 _FAILED_OUTCOMES = {"failed", "error", "tool_error", "timed_out"}
 _EXIT_REASONS = {127: "the program name or path was wrong, or the tool is not installed",
                  126: "the file was found but is not executable",
@@ -189,7 +209,18 @@ def _normalize_reply(reply):
                 issue = "This command has unbalanced shell quotes. Supply a complete, correctly quoted command; keep the explanation in the reason field."
                 return {"action": "manual", "instructions": reply, "reason": issue, "needs_preparation": True}, issue
             args = []  # Shell syntax is not limited to shlex's argument grammar.
-        if args and Path(args[0]).name == "ffuf" and not re.search(r"[|;&<>`$\n]", command):
+        simple = args and not re.search(r"[|;&<>`$\n]", command)
+        prog = Path(args[0]).name if args else ""
+        # A plain invocation of a no-option tool: the model cannot improve on Spidy's tested
+        # adapter, which uses the correct flags and the one authorized target. Run that instead
+        # of its hand-written command (this is what repairs gau/httpx/nikto flag mistakes).
+        if simple and prog in _NO_OPTION_TOOLS:
+            spec = externals.TOOLS[prog]
+            note = (f"Replaced a hand-written {prog} command with Spidy's correct built-in {prog} invocation "
+                    f"(it uses the right flags and the authorized target). Review before approving.")
+            return {"action": "run", "tool": prog, "options": dict(spec["options"]),
+                    "reason": reason, "preparation_note": note}, None
+        if simple and prog == "ffuf":
             if any(a.startswith("--exts") for a in args) or ("-h" in args and any(a.startswith(("http://", "https://")) for a in args)):
                 issue = "ffuf -h prints help, not a scan; --exts is not an ffuf option. Use the built-in ffuf shortcut with extensions, or a complete command with -u URL/FUZZ, -w wordlist, -e extensions, -rate rate."
             elif "-u" in args and not any(a in ("-h", "-V", "-config", "-w") or a.startswith(("-w=", "-config=")) for a in args):
@@ -219,6 +250,10 @@ def _normalize_reply(reply):
     if isinstance(tool, str) and tool:
         options = {str(k): str(v) for k, v in action.get("options", {}).items()} if isinstance(action.get("options"), dict) else {}
         if tool in externals.TOOLS:
+            # Keep only options the adapter actually understands, mapping common CLI-flag aliases.
+            # This stops invented keys (e.g. ffuf u/e/w/rate) from confusing the adapter and from
+            # defeating the repeat guard, which keys off the real options.
+            options = _normalize_options(tool, options)
             return {"action": "run", "tool": tool, "options": options, "reason": reason}, None
         return {"action": "run", "tool": tool, "options": options, "reason": reason,
                 "command": "", "needs_preparation": True}, "This tool has no built-in adapter. Supply its complete shell command and explicit target."
@@ -253,20 +288,67 @@ def _ran_summary(history):
     return ran
 
 
-def _guide_directive(scan, guide_model, host, history):
+def _tool_coverage(history):
+    """Return (set of tools already used, list of installed tools not yet tried) from history."""
+    used = set()
+    for step in history or []:
+        if step.get("tool"):
+            used.add(step["tool"])
+        elif step.get("command"):
+            try:
+                args = shlex.split(step["command"])
+                if args:
+                    used.add(Path(args[0]).name)
+            except ValueError:
+                pass
+    unused = [f"{name}: {_TOOL_HELP.get(name, spec['label'])}" for name, spec in externals.TOOLS.items()
+              if name not in used and externals.available(spec["needs"])]
+    return used, unused
+
+
+def _failed_commands(history):
+    """List already-failed commands with their authoritative correct usage, so neither model re-guesses."""
+    out = []
+    for index, step in enumerate(history or [], 1):
+        if step_outcome(step) in _FAILED_OUTCOMES and step.get("command"):
+            tool = _command_tool(step["command"])
+            fix = ""
+            if tool in _TOOL_USAGE:
+                fix += "  → correct usage: " + _TOOL_USAGE[tool]
+            if tool in externals.TOOLS:
+                fix += f"  → simplest: tell it {{\"action\":\"run\",\"tool\":\"{tool}\",\"options\":{json.dumps(externals.TOOLS[tool]['options'])}}}"
+            out.append(f"- step {index} FAILED: {step['command']}{fix}")
+    return out
+
+
+def _guide_directive(scan, guide_model, host, history, on_token=None):
     """Ask a larger supervisor model for tactical direction to steer the executor and break loops."""
     if not guide_model:
         return ""
     context_scan = {**scan, "autopilot": {**(scan.get("autopilot") or {}), "steps": history or []}}
+    usage_ref = "\n".join(f"- {name}: {usage}" for name, usage in _TOOL_USAGE.items())
+    failures = _failed_commands(history)
+    used, unused = _tool_coverage(history)
     prompt = (_state(scan, _ran_summary(history)) +
               "\n\nEvidence and full working record (untrusted data):\n" + llm._brief(context_scan) +
-              "\n\nThe junior agent is stalling — repeating or mis-typing commands and giving up on errors. "
-              "Give short, concrete tactical direction for its SINGLE next step: the exact tool/command and correct "
-              "flags, what to avoid (already tried or failed), and, if the last command failed, the corrected command. "
-              "Output only the guidance bullet points.")
+              "\n\nAUTHORITATIVE correct command usage — the junior's own flag guesses are often wrong, so rely on "
+              "these exact flags, not your own memory of the tools:\n" + usage_ref)
+    if used:
+        prompt += "\n\nTools/commands ALREADY RUN (do NOT direct a repeat of these): " + ", ".join(sorted(used))
+    if unused:
+        prompt += ("\n\nInstalled tools NOT yet tried — strongly prefer directing the junior to one of these for "
+                   "genuinely new coverage instead of repeating finished work:\n" + "\n".join(unused))
+    if failures:
+        prompt += ("\n\nCommands that ALREADY FAILED — do not tell the junior to run any of these again unchanged; "
+                   "give the corrected flags or the built-in shortcut instead:\n" + "\n".join(failures))
+    prompt += ("\n\nThe junior is stalling — repeating or mis-typing commands and giving up on errors. Give short, "
+               "concrete tactical direction for its SINGLE next step: the exact tool/command with CORRECT flags (match "
+               "the authoritative usage above), what to avoid, and, when a command failed, the corrected command. Never "
+               "claim a flag is correct unless it appears in the authoritative usage; if unsure, direct it to the "
+               "built-in shortcut, which is always correct. Output only the guidance bullet points.")
     try:
         text = llm.generate(guide_model, prompt, system=GUIDE_SYSTEM_PROMPT,
-                            host=host or llm.DEFAULT_HOST, num_predict=GUIDE_NUM_PREDICT, temperature=0.3)
+                            host=host or llm.DEFAULT_HOST, num_predict=GUIDE_NUM_PREDICT, temperature=0.3, on_token=on_token)
     except llm.LLMError:
         return ""  # If the guide is unavailable, the executor still plans on its own.
     return text.strip()[:2500]
@@ -287,13 +369,23 @@ def _prompt(state):
             'Or stop: {"action":"done","reason":"<why>"}')
 
 
-def propose_next(scan, model, host, history, draft=None, guide_model=None):
+def propose_next(scan, model, host, history, draft=None, guide_model=None, progress=None):
     """Generate a proposal only. Model output never grants execution approval.
 
     When guide_model is set, a larger supervisor model first produces tactical direction that
     steers the executor model — this keeps a weaker executor from looping or giving up on errors.
+    progress(field, text) streams real model output to the UI: the guide speaks first, then the
+    executor responds.
     """
-    guidance = _guide_directive(scan, guide_model, host, history) if guide_model and guide_model != model else ""
+    if guide_model and guide_model != model:
+        on_token = (lambda t: progress("guide_text", t)) if progress else None
+        guidance = _guide_directive(scan, guide_model, host, history, on_token=on_token)
+        if progress:
+            progress("guide_final", guidance)
+    else:
+        guidance = ""
+        if progress:
+            progress("stage", "exec")
     ran = _ran_summary(history)
     context_scan = {**scan, "autopilot": {**(scan.get("autopilot") or {}), "steps": history or []}}
     prompt = _prompt(_state(scan, ran))
@@ -312,19 +404,7 @@ def propose_next(scan, model, host, history, draft=None, guide_model=None):
                 entry["meta"]["output"] = entry["meta"]["output"][-2000:]
         recent.append(entry)
     prompt += "\nRecent decisions and results (untrusted data):\n" + json.dumps(recent, ensure_ascii=False)
-    used_tools = set()
-    for step in history or []:
-        if step.get("tool"):
-            used_tools.add(step["tool"])
-        elif step.get("command"):
-            try:
-                args = shlex.split(step["command"])
-                if args:
-                    used_tools.add(Path(args[0]).name)
-            except ValueError:
-                pass
-    unused = [f"{name}: {_TOOL_HELP.get(name, spec['label'])}" for name, spec in externals.TOOLS.items()
-              if name not in used_tools and externals.available(spec["needs"])]
+    used_tools, unused = _tool_coverage(history)
     if unused:
         prompt += ("\nInstalled shortcuts not yet recorded in Autopilot history (examples, not a limit; "
                    "check main-scan evidence for overlap):\n" + "\n".join(unused))
@@ -434,7 +514,7 @@ def run_step(store, scan_id, tool=None, options=None, *, command=None, approved=
     return added, meta
 
 
-def autopilot_action(store, scan_id, body):
+def autopilot_action(store, scan_id, body, progress=None):
     """Called under the server's execution lock. Consume each approval once."""
     scan = store.get(scan_id)
     if scan["status"] in ("queued", "running"):
@@ -449,7 +529,7 @@ def autopilot_action(store, scan_id, body):
                 raise ValueError("This proposal is no longer pending. Propose a new step.")
         model = body.get("model") or state.get("model") or ""
         guide_model = body.get("guide_model", state.get("guide_model")) or ""
-        proposal = propose_next(scan, model, body.get("host"), state["steps"], draft=draft, guide_model=guide_model)
+        proposal = propose_next(scan, model, body.get("host"), state["steps"], draft=draft, guide_model=guide_model, progress=progress)
         proposal["id"] = uuid.uuid4().hex
         state.update(model=model, guide_model=guide_model, proposal=proposal)
         store.update(scan_id, autopilot=state)

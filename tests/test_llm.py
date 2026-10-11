@@ -63,6 +63,35 @@ class LLMTests(unittest.TestCase):
         with self.assertRaises(llm.LLMError):
             llm.models("ftp://evil.example")
 
+    def test_models_detailed_sorts_by_size_largest_first(self):
+        payload = {"models": [{"name": "small:latest", "size": 2_000_000_000}, {"name": "big:8b", "size": 9_000_000_000}]}
+        with patch("spidy.llm._request", return_value=payload):
+            detailed = llm.models_detailed()
+        self.assertEqual([m["name"] for m in detailed], ["big:8b", "small:latest"])
+        self.assertEqual(detailed[0]["size"], 9_000_000_000)
+
+    def test_generate_streams_real_tokens_to_callback(self):
+        from unittest.mock import MagicMock
+        lines = [json.dumps({"response": "Run "}).encode(), json.dumps({"response": "nikto"}).encode(),
+                 json.dumps({"response": " next", "done": True}).encode()]
+        resp = MagicMock(); resp.status = 200
+        resp.__enter__ = lambda s: resp; resp.__exit__ = lambda *a: False
+        resp.__iter__ = lambda s: iter(lines)
+        seen = []
+        with patch("urllib.request.urlopen", return_value=resp):
+            out = llm.generate("m", "p", on_token=lambda t: seen.append(t))
+        self.assertEqual(out, "Run nikto next")
+        self.assertEqual(seen, ["Run ", "Run nikto", "Run nikto next"])  # progressively growing real text
+
+    def test_streamed_empty_response_is_an_error(self):
+        from unittest.mock import MagicMock
+        resp = MagicMock(); resp.status = 200
+        resp.__enter__ = lambda s: resp; resp.__exit__ = lambda *a: False
+        resp.__iter__ = lambda s: iter([json.dumps({"done": True}).encode()])
+        with patch("urllib.request.urlopen", return_value=resp):
+            with self.assertRaises(llm.LLMError):
+                llm.generate("m", "p", on_token=lambda t: None)
+
     def test_report_includes_model_analysis_when_present(self):
         from spidy.store import markdown_report
         from spidy.pdf_report import pdf_report
