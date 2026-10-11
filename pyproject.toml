@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spidy-agent"
+version = "0.3.0"
+description = "A local, scope-aware website security assessment agent"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+spidy = "spidy.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["spidy*"]
+
+[tool.setuptools.package-data]
+spidy = ["static/*"]
