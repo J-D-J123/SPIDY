@@ -70,12 +70,19 @@ def finding_context(finding):
         priority = "Hardening"
     else:
         priority = "Context only"
-    return {"check": check, "why_tested": METHODS[check][1], "method": METHODS[check][2],
+    context = {"check": check, "why_tested": METHODS[check][1], "method": METHODS[check][2],
             "certainty": certainty, "priority": priority,
             "verification": verification(check),
             "reproduction": [f"Review the recorded activity for {safe_url(finding['url'])} and its matching evidence entry.",
                              "Reproduce only within the approved scope, using a test environment where practical.",
                              "Use the recommendation and verification notes to check whether the behavior is intended and whether the fix works."]}
+    if finding.get("source") == "ffuf":
+        context.update(method="Request wordlist paths with ffuf and record matching HTTP statuses and response sizes. "
+                       "No missing-path control or content-signature validation was performed by this adapter.",
+                       certainty="HTTP response observed; exposure unconfirmed", priority="Context only",
+                       verification="Review the saved status and response evidence. A 401/403 response does not prove file existence or exposure; "
+                       "a 200 response can be an ordinary page or a generic fallback. Confirm content and intended routing before remediation.")
+    return context
 
 
 def verification(check):

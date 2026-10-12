@@ -49,6 +49,10 @@ class LLMError(Exception):
     """A sanitized local-LLM failure suitable to show the operator."""
 
 
+class GenerationRejected(LLMError):
+    """A bounded response check stopped generation; never reuse its partial text."""
+
+
 def _valid_host(host):
     if not isinstance(host, str) or not re.fullmatch(r"https?://[A-Za-z0-9.\-\[\]]+(?::\d{1,5})?/?", host):
         raise LLMError("Invalid Ollama host. Use something like http://127.0.0.1:11434.")
@@ -103,7 +107,7 @@ def available(host=DEFAULT_HOST):
         return False
 
 
-def generate(model, prompt, system="", host=DEFAULT_HOST, num_predict=400, temperature=0.1, response_format=None, on_token=None):
+def generate(model, prompt, system="", host=DEFAULT_HOST, num_predict=400, temperature=0.1, response_format=None, on_token=None, output_guard=None):
     """Single-shot local-model completion. With on_token, stream real output as it is produced.
 
     on_token(accumulated_text) is called as each chunk arrives, so the UI can show the model's
@@ -112,11 +116,11 @@ def generate(model, prompt, system="", host=DEFAULT_HOST, num_predict=400, tempe
     if not isinstance(model, str) or not _MODEL_NAME.fullmatch(model):
         raise LLMError("Choose a valid installed model name.")
     options = {"temperature": temperature, "num_predict": num_predict, "num_ctx": 16384}
-    payload = {"model": model, "system": system, "prompt": prompt, "stream": bool(on_token), "options": options}
+    payload = {"model": model, "system": system, "prompt": prompt, "stream": bool(on_token or output_guard), "options": options}
     if response_format is not None:
         payload["format"] = response_format
-    if on_token:
-        return _generate_stream(host, payload, on_token)
+    if on_token or output_guard:
+        return _generate_stream(host, payload, on_token, output_guard)
     data = _request(host, "/api/generate", payload)
     text = data.get("response")
     if not isinstance(text, str):
@@ -124,12 +128,13 @@ def generate(model, prompt, system="", host=DEFAULT_HOST, num_predict=400, tempe
     return text
 
 
-def _generate_stream(host, payload, on_token):
+def _generate_stream(host, payload, on_token, output_guard=None):
     """POST with stream=true and feed Ollama's NDJSON chunks to on_token as they arrive."""
     url = _valid_host(host) + "/api/generate"
     request = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
                                      headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"})
     pieces, total = [], 0
+    finished = False
     try:
         with urllib.request.urlopen(request, timeout=GENERATE_TIMEOUT) as response:
             if response.status != 200:
@@ -148,23 +153,32 @@ def _generate_stream(host, payload, on_token):
                 chunk = obj.get("response")
                 if isinstance(chunk, str) and chunk:
                     pieces.append(chunk)
-                    try:
-                        on_token("".join(pieces))
-                    except Exception:  # noqa: BLE001 - a UI callback must never break generation
-                        pass
+                    accumulated = "".join(pieces)
+                    if output_guard:
+                        output_guard(accumulated)  # Deliberately outside the UI callback exception handler.
+                    if on_token:
+                        try:
+                            on_token(accumulated)
+                        except Exception:  # noqa: BLE001 - a UI callback must never break generation
+                            pass
                 if obj.get("done"):
+                    finished = True
+                    if output_guard and obj.get("done_reason") == "length":
+                        raise GenerationRejected("Generation reached its token limit without finishing. Partial output was discarded.")
                     break
     except urllib.error.HTTPError as exc:
         raise LLMError(f"Ollama returned HTTP {exc.code}." + (" Has that model been pulled?" if exc.code == 404 else ""))
     except (urllib.error.URLError, OSError, TimeoutError):
         raise LLMError("Could not reach a local Ollama server. Start it with `ollama serve` and pull a model.")
+    if output_guard and not finished:
+        raise GenerationRejected("Generation ended before completion. Partial output was discarded.")
     text = "".join(pieces)
     if not text.strip():
         raise LLMError("The model returned an empty response.")
     return text
 
 
-def _brief(scan):
+def _brief(scan, include_progress=True):
     """Compact, redacted brief of the assessment for the model (no raw query values)."""
     assessment = analyze(scan)
     view = inventory_view(scan)
@@ -191,7 +205,7 @@ def _brief(scan):
     coverage = scan.get("coverage", {})
     lines += ["", f"Coverage: {coverage.get('pages_received', 0)} pages, scanner {coverage.get('scanner', 'n/a')}, "
               f"input probes {coverage.get('input_probe_mode', 'n/a')}."]
-    return "\n".join(lines)[:24000] + "\n\n" + assessment_progress(scan)
+    return "\n".join(lines)[:24000] + ("\n\n" + assessment_progress(scan) if include_progress else "")
 
 
 def analyze_scan(scan, model, host=DEFAULT_HOST):

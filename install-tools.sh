@@ -96,8 +96,12 @@ echo "== Script tools (nikto, testssl.sh) =="
 if have perl; then
   [ -d "$SRC/nikto" ] || git clone -q --depth 1 https://github.com/sullo/nikto "$SRC/nikto" 2>/dev/null
   if [ -f "$SRC/nikto/program/nikto.pl" ]; then
-    printf '#!/usr/bin/env bash\nexec perl "%s/program/nikto.pl" "$@"\n' "$SRC/nikto" > "$BIN/nikto"
-    chmod +x "$BIN/nikto"; ok nikto
+    if ! perl -I "$TOOLS/perl5/lib/perl5" -MXML::Writer -e 1 2>/dev/null; then
+      python3 "$ROOT/scripts/install-nikto-deps.py" || echo "   XML::Writer installation failed; Nikto needs repair."
+    fi
+    printf '#!/usr/bin/env bash\nexec perl -I "%s/perl5/lib/perl5" "%s/program/nikto.pl" "$@"\n' "$TOOLS" "$SRC/nikto" > "$BIN/nikto"
+    chmod +x "$BIN/nikto"
+    if "$BIN/nikto" -Version; then ok nikto; else skip nikto "local startup check failed"; fi
   else skip nikto "clone failed"; fi
 else skip nikto "perl not installed"; fi
 [ -d "$SRC/testssl" ] || git clone -q --depth 1 https://github.com/drwetter/testssl.sh "$SRC/testssl" 2>/dev/null

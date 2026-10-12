@@ -15,6 +15,24 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from contextvars import ContextVar
+
+from .process_output import capture
+
+_output_observer = ContextVar("tool_output_observer", default=None)
+
+
+def _run_process(args, **kwargs):
+    observer = _output_observer.get()
+    if observer is None:
+        return subprocess.run(args, **kwargs)
+    meta, stdout = capture(args, timeout=kwargs["timeout"], on_output=observer, separate_stdout=True)
+    observer({**meta, "output": meta["output_tail"]})
+    if kwargs.get("text"):
+        stdout = stdout.decode("utf-8", "replace")
+    if meta["timed_out"]:
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"], output=stdout)
+    return subprocess.CompletedProcess(args, meta["exit_code"], stdout=stdout)
 
 _BIN = Path(__file__).resolve().parent.parent / "tools" / "bin"
 
@@ -34,6 +52,22 @@ def available(name):
     return tool_path(name) is not None
 
 
+def tool_readiness(name):
+    """Check local prerequisites only; never contact the assessment target."""
+    spec = TOOLS.get(name)
+    if not spec or not available(spec["needs"]):
+        return {"ready": False, "error": f"{name} is not installed."}
+    if name == "nikto":
+        try:
+            result = subprocess.run([tool_path("nikto"), "-Version"], capture_output=True,
+                                    text=True, timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"ready": False, "error": f"Nikto could not start locally: {exc}"}
+        if result.returncode != 0:
+            return {"ready": False, "error": (result.stderr or result.stdout or "Nikto startup failed.").strip()[:500]}
+    return {"ready": True, "error": ""}
+
+
 def run_wafw00f(url, timeout=60):
     """Return the WAFs/CDNs wafw00f fingerprints in front of the URL."""
     path = tool_path("wafw00f")
@@ -42,7 +76,7 @@ def run_wafw00f(url, timeout=60):
     tmp = tempfile.mkdtemp()
     out = os.path.join(tmp, "waf.json")
     try:
-        subprocess.run([path, "-f", "json", "-o", out, url], capture_output=True, timeout=timeout, check=False)
+        _run_process([path, "-f", "json", "-o", out, url], capture_output=True, timeout=timeout, check=False)
         with open(out) as handle:
             data = json.load(handle)
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -104,7 +138,7 @@ def run_nuclei(url, rate=15, concurrency=10, request_timeout=10, overall_timeout
     if tags:
         args += ["-tags", tags]
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=overall_timeout, check=False)
+        proc = _run_process(args, capture_output=True, text=True, timeout=overall_timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         # Keep whatever nuclei produced before the deadline.
         partial = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace")
@@ -137,7 +171,7 @@ def _int(value, default, low, high):
 
 def _exec(args, timeout):
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False).stdout or ""
+        return _run_process(args, capture_output=True, text=True, timeout=timeout, check=False).stdout or ""
     except subprocess.TimeoutExpired as exc:
         return (exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace")) or ""
     except OSError as exc:
@@ -268,11 +302,15 @@ def _ffuf_tool(target, opts, cancelled=None):
             continue
         status = row.get("status")
         url = str(row.get("url", ""))
-        severity = "low" if status in (200, 401, 403) else "info"
-        items.append(_norm(f"Discovered path: {_urlsplit(url).path or '/'}", severity, "medium",
+        denied = status in (401, 403)
+        label = "Access restricted" if denied else "Path response observed"
+        item = _norm(f"{label}: {_urlsplit(url).path or '/'}", "info", "medium",
                            f"ffuf: {url} -> HTTP {status} ({row.get('length', '?')} bytes)",
-                           "A path responded that is not a normal page; it may expose files, admin areas, or configuration.",
-                           "Confirm whether the path should be public; restrict or remove it if not.", DISCOVERY_REF, "discovery"))
+                           ("The server denied access or required authentication. This does not establish that the requested file exists or is exposed."
+                            if denied else "A requested path returned an HTTP response. Status and size alone do not establish sensitive content or a vulnerability."),
+                           "Review existing response evidence and intended routing with the owner before treating this as an exposure.", DISCOVERY_REF, "discovery")
+        item["url"] = url
+        items.append(item)
     return items, {"count": len(items)}
 
 
@@ -363,14 +401,42 @@ TOOLS = {
 
 def tools_status():
     return [{"name": name, "label": spec["label"], "input": spec["input"],
-             "installed": available(spec["needs"]), "needs": spec["needs"], "options": spec["options"]}
+             "installed": available(spec["needs"]), "needs": spec["needs"], "options": spec["options"],
+             **tool_readiness(name)}
             for name, spec in TOOLS.items()]
 
 
-def run_tool(name, target, options=None, cancelled=None):
+def validate_options(name, options):
+    if name == "ffuf":
+        extensions = [item.strip() for item in str(options.get("extensions") or "").split(",") if item.strip()]
+        if len(extensions) != len(set(extensions)):
+            raise ToolError("ffuf extensions contain repeated entries. Supply each extension once; repetitions add no new coverage.")
+    if name == "nuclei":
+        tags = str(options.get("tags") or "").strip()
+        if tags.casefold() in {"none", "null", "n/a"}:
+            raise ToolError("nuclei tags must name real template tags. To omit the tag filter, use an empty string; 'none' is a literal tag, not no filter.")
+        severity = str(options.get("severity") or "").strip()
+        if severity and not set(severity.split(",")) <= {"info", "low", "medium", "high", "critical", "unknown"}:
+            raise ToolError("nuclei severity must be a comma-separated list of info, low, medium, high, critical, or unknown.")
+
+
+def run_tool(name, target, options=None, cancelled=None, on_output=None):
     spec = TOOLS.get(name)
     if not spec:
         raise ToolError(f"Unknown tool: {name}")
-    if not available(spec["needs"]):
-        raise ToolError(f"{spec['needs']} is not installed (run install-tools.sh).")
-    return spec["run"](target, options or {}, cancelled)
+    validate_options(name, options or {})
+    readiness = tool_readiness(name)
+    if not readiness["ready"]:
+        raise ToolError(readiness["error"] + " Repair the local tool installation before retrying.")
+    terminal = {}
+
+    def observe(snapshot):
+        terminal.update(snapshot)
+        on_output(snapshot)
+
+    token = _output_observer.set(observe if on_output else None)
+    try:
+        items, meta = spec["run"](target, options or {}, cancelled)
+        return items, {**meta, **terminal}
+    finally:
+        _output_observer.reset(token)

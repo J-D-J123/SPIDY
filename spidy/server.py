@@ -11,7 +11,7 @@ from .scanner import Scanner, focus_checks, validate_config
 from .store import LIMITATIONS, add_external_findings, markdown_report, now
 from .analysis import advisory_verification, analyze, email_draft
 from .host_inventory import validate_host_inventory
-from . import llm, externals, agent
+from . import llm, externals, agent, runtime
 from .pdf_report import pdf_report
 from .progress import assessment_progress
 
@@ -88,6 +88,7 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
     autopilot_workers = {}
     autopilot_workers_lock = threading.Lock()
     token = secrets.token_urlsafe(32)
+    instance_id = secrets.token_hex(8)
     static = Path(__file__).parent / "static"
 
     def settle_autopilot_task(scan_id, task_id, error):
@@ -123,6 +124,12 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
                         task["stage"] = "exec"
                 elif field == "stage":
                     task["stage"] = str(text)
+                elif field == "validation_text":
+                    task["validation_text"] = str(text)[:1500]
+                elif field == "terminal":
+                    task["terminal"] = text
+                elif field == "discussion":
+                    task["discussion"] = text
                 state["task"] = task
                 store.update(scan_id, autopilot=state)
         return progress
@@ -139,6 +146,8 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
 
     def dispatch_autopilot(scan_id, body):
         """Return immediately: planning and execution run in the background and are polled."""
+        if runtime.status()["restart_required"]:
+            raise ValueError("Spidy was updated. Restart the local server and refresh the dashboard before continuing Autopilot.")
         action = body.get("action", "plan")
         with autopilot_lock:
             scan = store.get(scan_id)
@@ -158,16 +167,24 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
                 return agent.autopilot_action(store, scan_id, body)  # Fast; keep it synchronous.
             if action not in ("plan", "repair", "run"):
                 raise ValueError("Unknown autopilot action.")
+            if action in ("plan", "repair"):
+                body["guide_context"] = agent.validate_guide_context(body.get("guide_context", state.get("guide_context", "")))
             task_id = secrets.token_hex(8)
             kind = "run" if action == "run" else "plan"
             state.setdefault("steps", [])
             state["task"] = {"id": task_id, "kind": kind, "status": "running", "started": now()}
+            if kind == "run":
+                pending = state.get("proposal") or {}
+                state["task"]["submitted_action"] = {"command": body.get("command", pending.get("command")),
+                    "tool": pending.get("tool"), "options": body.get("options", pending.get("options", {}))}
             if kind == "plan":
                 # The guide speaks first (only when it is a different model), then the executor responds.
                 g = body.get("guide_model", state.get("guide_model")) or ""
                 m = body.get("model") or state.get("model") or ""
                 state["task"]["stage"] = "guide" if (g and g != m) else "exec"
                 state["task"]["guide_text"] = ""
+                state["task"]["model"] = m
+                state["task"]["guide_model"] = g
             store.update(scan_id, autopilot=state)
             worker = threading.Thread(target=run_autopilot_task, args=(scan_id, body, task_id), daemon=True)
             with autopilot_workers_lock:
@@ -221,7 +238,8 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
             path = urlsplit(self.path).path
             try:
                 if path == "/api/config":
-                    self.reply(200, {"token": token, "allow_private": allow_private, "demo_target": demo_target, "limitations": LIMITATIONS})
+                    self.reply(200, {"token": token, "allow_private": allow_private, "demo_target": demo_target,
+                                     "limitations": LIMITATIONS, "instance_id": instance_id, **runtime.status()})
                 elif path == "/api/scans":
                     self.reply(200, store.list())
                 elif path == "/api/tools":
@@ -320,7 +338,7 @@ def create_server(store, port=8765, allow_private=False, demo_target=None):
                         raise ValueError(str(exc))
                     added = add_external_findings(scan, items, source=name)
                     store.update(pieces[2], findings=scan["findings"])
-                    store.append(pieces[2], "events", {"time": now(), "type": "deep_scan", "tool": name, "target": where, "added": added, **meta})
+                    store.append(pieces[2], "events", {"time": now(), "type": "deep_scan", "tool": name, "target": where, "added": added, **meta, "options": options})
                     self.reply(200, {"tool": name, "added": added, "findings": len(scan["findings"]), "meta": meta})
                 elif len(pieces) == 4 and pieces[:2] == ["api", "scans"] and pieces[3] == "analyze":
                     scan = store.get(pieces[2])

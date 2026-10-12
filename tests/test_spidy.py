@@ -348,7 +348,9 @@ class ApiTests(unittest.TestCase):
             settled = self._await_autopilot(scan["id"])
             self.assertIsNone(settled["task"])
             self.assertEqual(settled["steps"][-1]["meta"]["output"], "edited")
-            execute.assert_called_once_with("printf edited")
+            execute.assert_called_once()
+            self.assertEqual(execute.call_args.args, ("printf edited",))
+            self.assertTrue(callable(execute.call_args.kwargs["on_output"]))
             # The proposal is single-use: replaying it fails (no second execution).
             self.assertEqual(self.request("POST", path, body, headers)[0], 200)
             self.assertIn("no longer pending", self._await_autopilot(scan["id"])["task"]["error"].lower())
@@ -364,7 +366,8 @@ class ApiTests(unittest.TestCase):
             # Keep the patch active until the background planner has produced its proposal.
             proposal_id = self._await_autopilot(scan["id"])["proposal"]["id"]
         entered, release = threading.Event(), threading.Event()
-        def execute(command):
+        def execute(command, on_output=None):
+            on_output({"command": command, "output": "live first line", "exit_code": None})
             entered.set()
             release.wait(timeout=5)
             return {"output": "test", "exit_code": 0}
@@ -374,6 +377,10 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.request("POST", path, body, headers)[0], 200)
             try:
                 self.assertTrue(entered.wait(timeout=2))
+                status, live = self.request("GET", f"/api/scans/{scan['id']}")
+                self.assertEqual(status, 200)
+                self.assertEqual(live["autopilot"]["task"]["terminal"]["output"], "live first line")
+                self.assertEqual(live["autopilot"]["steps"][-1]["outcome"], "running")
                 # While that worker is executing, a second run and a new plan are both rejected.
                 self.assertEqual(self.request("POST", path, body, headers)[0], 400)
                 self.assertEqual(self.request("POST", path, {"action": "plan", "model": "local"}, headers)[0], 400)
@@ -385,6 +392,22 @@ class ApiTests(unittest.TestCase):
     def test_dashboard_and_static_assets(self):
         for path in ("/", "/app.js", "/style.css"):
             self.assertEqual(self.request("GET", path)[0], 200)
+
+    def test_backend_revision_detects_updates_before_an_autopilot_action(self):
+        status, config = self.request("GET", "/api/config")
+        self.assertEqual(status, 200)
+        self.assertEqual(config["planner_protocol"], 2)
+        self.assertFalse(config["restart_required"])
+        scan = self.store.create(validate_config({"target": "https://example.test/", "authorized": True}))
+        self.store.update(scan["id"], status="completed")
+        with patch("spidy.runtime.source_revision", return_value="changed-on-disk"), \
+                patch("spidy.agent.propose_next") as plan:
+            self.assertTrue(self.request("GET", "/api/config")[1]["restart_required"])
+            status, response = self.request("POST", f"/api/scans/{scan['id']}/autopilot",
+                                            {"action": "plan", "model": "local"}, {"X-Spidy-Token": self.token})
+        self.assertEqual(status, 400)
+        self.assertIn("Restart", response["error"])
+        plan.assert_not_called()
 
     def test_dns_rebinding_host_blocked(self):
         self.assertEqual(self.request("GET", "/api/config", headers={"Host": "evil.example"})[0], 403)

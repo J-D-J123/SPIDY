@@ -15,6 +15,7 @@
   <div class="navbar"><div class="wrap">
     <button class="nav-item active" id="new-scan-nav">Assessments <span class="nav-count" id="scan-count">0</span></button>
     <button class="nav-item" id="how-it-works">How Spidy works</button>
+    <button class="nav-item" id="command-log-nav">Command log</button>
     <span class="version">Version 0.3</span>
   </div></div>
   <div class="wrap page">
@@ -26,6 +27,7 @@
       <div class="breadcrumb">Workspace / <strong>Assessments</strong></div>
       <div class="page-heading"><div class="eyebrow">Meet your security sidekick</div><h1>A little curious. <span>A lot thorough.</span></h1><p>Give Spidy a target. Get a clear picture of its security, one check at a time.</p></div>
       <div id="connection-error" role="alert" class="notice error hidden"></div>
+      <div id="runtime-notice" role="alert" class="notice error hidden"></div>
       <div id="demo-banner" class="notice hidden"><strong>Local playground is ready.</strong> Try the demo to see findings and scope approvals without contacting an external site.<button id="load-demo" class="text-button">Load demo target</button></div>
       <div class="workspace-grid" id="setup">
         <section class="panel setup-panel"><div class="panel-heading"><h2>Set your sights</h2><p>Choose what Spidy should look into.</p></div>
@@ -69,9 +71,33 @@
         <div id="tab-email" class="tab-panel panel hidden" role="tabpanel"><div class="list-heading"><div><h3>A draft you can make your own</h3><p>Review the observations, add your assessment context and contact details, then copy it into your email app. Attach the report yourself.</p></div><span class="badge">Draft only</span></div><div class="email-editor"><label for="email-draft">Email to the site owner</label><textarea id="email-draft" rows="22" maxlength="12000" spellcheck="true" placeholder="Your draft will be available when the assessment finishes."></textarea><div class="email-actions"><button id="save-draft" class="primary">Save draft locally</button><button id="copy-draft" class="secondary">Copy text</button><button id="download-email" class="secondary">Download .txt</button><span id="draft-status" role="status" class="muted small"></span></div><p class="small muted">Query values are removed from generated emails. Review the report for sensitive details before sharing it. Spidy does not send email.</p></div></div>
         <div id="tab-scope" class="tab-panel panel hidden" role="tabpanel"><div class="list-heading"><div><h3>You control where Spidy goes</h3><p>Approving an origin starts a follow-up scan with a fresh request budget. Confirm you have permission for that origin.</p></div></div><div id="scope-list"></div><div id="scope-error" class="notice error hidden" role="alert"></div></div>
         <div id="tab-activity" class="tab-panel panel hidden" role="tabpanel"><div class="list-heading"><h3>The full trail</h3><span class="muted small">Requests, checks, and scope decisions</span></div><div id="activity-list"></div></div>
-        <div id="tab-tools" class="tab-panel panel hidden" role="tabpanel"><div class="list-heading"><div><h3>Deep scans — run more tools, your parameters</h3><p>After the main scan, run any installed tool against this target and fold its findings in. Detection only. Tools resolve DNS themselves, so only run them against targets you are authorized to assess.</p></div></div><div class="autopilot-box"><div><strong>Autopilot — the model proposes, you approve</strong><p class="small muted">The model can propose any tool, command, script, or investigation. Review the proposed action and click Approve &amp; run. Each step waits for your permission.</p></div><div class="autopilot-run"><label>Executor model <select id="autopilot-model" class="model-select"><option value="">No models found</option></select></label> <label>Guide model <span class="optional">optional</span> <select id="autopilot-guide-model"><option value="">None (executor only)</option></select></label> <button id="autopilot-plan" class="primary">Propose next step</button> <span id="autopilot-status" class="muted small"></span></div><div id="autopilot-guide-hint" class="small muted"></div><p class="small muted">The guide is a bigger, smarter model that reviews what's been tried and gives the executor tactical direction — it corrects failed commands and keeps the executor from looping or giving up. Leave it as None to use the executor alone.</p><div id="autopilot-proposal"></div><div id="autopilot-steps"></div></div><div id="tools-list"></div><div id="tools-error" class="notice error hidden" role="alert"></div></div>
+        <div id="tab-tools" class="tab-panel panel hidden" role="tabpanel"><div class="list-heading"><div><h3>Deep scans</h3><p>Guide the investigation, review the conversation, and follow each command as it runs.</p></div></div><section class="autopilot-box planning-studio" aria-label="Guide and executor workspace">
+  <div class="studio-heading"><div><div class="eyebrow">MODEL WORKSPACE</div><h3>Plan the next investigation</h3><p>Talk to the guide. Watch the models work through the next step.</p></div><span class="studio-badge">Local models</span></div>
+  <div class="model-team">
+    <label class="model-seat guide-seat"><span class="seat-heading"><span class="role-avatar">G</span><span><strong>Guide</strong><small>Reviews evidence &amp; your context</small></span></span><select id="autopilot-guide-model" aria-label="Guide model"><option value="">None (executor only)</option></select></label>
+    <div class="team-connector" aria-hidden="true">⇄</div>
+    <label class="model-seat executor-seat"><span class="seat-heading"><span class="role-avatar">E</span><span><strong>Executor</strong><small>Prepares a command for review</small></span></span><select id="autopilot-model" class="model-select" aria-label="Executor model"><option value="">No models found</option></select></label>
+  </div>
+  <div id="autopilot-guide-hint" class="small muted"></div>
+  <div class="studio-toolbar"><button id="autopilot-plan" class="primary">Propose next step</button><label class="auto-approve-toggle"><input id="autopilot-auto-approve" type="checkbox" role="switch" aria-describedby="autopilot-auto-help"><span>Auto-approve</span></label><span id="autopilot-auto-state" class="auto-mode-status" role="status">Auto-approve off</span></div>
+  <div id="autopilot-status" class="studio-status small muted" role="status" aria-live="polite"></div>
+  <div id="autopilot-steps"></div>
+  <div class="guide-composer chat-composer"><label class="visually-hidden" for="autopilot-guide-context">Message your guide</label><textarea id="autopilot-guide-context" rows="1" maxlength="4000" placeholder="Message your guide…" aria-describedby="guide-context-help"></textarea><div class="composer-footer"><span class="composer-recipient">↳ Guide context</span><button id="autopilot-send-context" class="composer-send" type="button" aria-label="Send context and replan" title="Send context and replan"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div><div id="guide-context-status" class="small muted" role="status"></div><p id="guide-context-help" class="small muted">Enter to send · Shift + Enter for a new line. Context stays with this assessment until you replace or clear it. Sending keeps your auto-approve setting.</p></div>
+  <div id="autopilot-proposal"></div>
+  <details class="studio-help"><summary>How the models and approvals work</summary><p class="small muted">The guide suggests a direction; the executor proposes an action. Rejected drafts go back to the guide for a correction. The conversation shows their actual replies and Spidy’s checks.</p><p id="autopilot-auto-help" class="small muted">Review each action with Approve &amp; run, or enable Auto-approve next steps. Auto-approval runs commands with your local user permissions, including local changes, while this page stays open. Refreshing or switching assessments turns it off. Turning auto-approve on starts or resumes planning. It stays on while waiting for a valid action and when you send context. Blocked drafts never execute. Turn it off or click Stop to pause automatic execution.</p></details>
+</section><details class="manual-tools"><summary>Manual scanner tools <span class="optional">Advanced</span></summary><p class="small muted">Run an individual tool with your own parameters.</p><div id="tools-list"></div><div id="tools-error" class="notice error hidden" role="alert"></div></details></div>
         <div id="tab-coverage" class="tab-panel panel hidden" role="tabpanel"><div class="list-heading"><h3>Coverage & limitations</h3></div><div id="coverage-list"></div><p class="limitations" id="limitations"></p></div>
         <p class="report-footnote">A completed assessment is a bounded set of checks, not a guarantee of security. Validate suspected vulnerabilities manually.</p>
+      </section>
+      <section id="commandlog-view" class="hidden" aria-label="Command log">
+        <div class="page-heading"><div class="eyebrow">Guide &amp; executor transcript</div><h1>Command log</h1><p>Every step the guide proposed and the executor ran, for one assessment, read back as a conversation.</p></div>
+        <div class="panel commandlog-picker">
+          <label for="commandlog-scan">Open the command log for</label>
+          <select id="commandlog-scan"><option value="">Choose an assessment…</option></select>
+          <span id="commandlog-meta" class="muted small"></span>
+        </div>
+        <div id="commandlog-error" role="alert" class="notice error hidden"></div>
+        <div id="commandlog-body" class="chatlog"><div class="chatlog-empty">Pick an assessment above to read its guide and executor command log.</div></div>
       </section>
     </main>
   </div>

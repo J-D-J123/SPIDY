@@ -559,6 +559,8 @@ class DeepScanToolTests(unittest.TestCase):
 
 class AutopilotTests(unittest.TestCase):
     def setUp(self):
+        readiness = patch("spidy.externals.tool_readiness", return_value={"ready": True, "error": ""})
+        readiness.start(); self.addCleanup(readiness.stop)
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         from spidy.store import Store
         from spidy.scanner import validate_config
@@ -570,6 +572,246 @@ class AutopilotTests(unittest.TestCase):
         from spidy import agent
         self.assertEqual(agent._extract_json('sure: {"action":"done","reason":"x"} ok')["action"], "done")
         self.assertIsNone(agent._extract_json("no json here"))
+
+    def test_manual_scan_is_memory_for_both_models_and_duplicate_guard(self):
+        from spidy import agent
+        self.store.append(self.scan["id"], "events", {"type": "deep_scan", "tool": "httpx",
+                          "target": "https://t.test/", "added": 0})
+        scan = self.store.get(self.scan["id"])
+        replies = ["Use httpx again", '{"action":"run","tool":"httpx"}',
+                   '{"action":"run","tool":"gau"}']
+        with patch("spidy.agent.llm.generate", side_effect=replies) as generate:
+            proposal = agent.propose_next(scan, "executor", None, [], guide_model="guide")
+        self.assertEqual(proposal["tool"], "gau")
+        self.assertEqual(proposal["rejected_repeats"][0]["matched_steps"], ["manual event 1"])
+        for call in generate.call_args_list:
+            self.assertIn("manual event 1", call.args[1])
+        self.assertNotIn("Use httpx again", generate.call_args_list[-1].args[1])
+        self.assertNotIn("The junior is stalling", generate.call_args_list[0].args[1])
+        self.assertEqual(generate.call_args_list[-1].args[0], "guide")
+        self.assertIn("REJECTED DUPLICATE", generate.call_args_list[-1].args[1])
+        self.assertEqual(proposal["source"], "guide_repair")
+        self.assertNotIn("guidance", proposal, "rejected initial guidance is not shown as current advice")
+
+    def test_guide_correction_is_validated_and_bounded(self):
+        from spidy import agent
+        history = [{"outcome": "ran", "tool": name} for name in agent.externals.TOOLS]
+        reply = '{"action":"run","tool":"wafw00f","reason":"inspect CSP"}'
+        with patch("spidy.agent.llm.generate", return_value=reply) as generate, \
+                patch("spidy.agent._run_command") as command, patch("spidy.externals.run_tool") as builtin:
+            p = agent.propose_next(self.store.get(self.scan["id"]), "executor", None, history, guide_model="guide")
+        self.assertEqual(p["action"], "paused")
+        self.assertIn("No unused built-in fallback", p["reason"])
+        self.assertEqual([c.args[0] for c in generate.call_args_list], ["guide", "executor", "guide", "executor", "executor"])
+        self.assertEqual(len(p["planning_attempts"]), agent.MAX_PROPOSAL_ATTEMPTS + 1)
+        self.assertIn("REJECTED DUPLICATE", p["planning_attempts"][1]["issue"])
+        self.assertNotIn("guidance", p)
+        command.assert_not_called()
+        builtin.assert_not_called()
+
+    def test_guide_outage_does_not_stop_executor_correction(self):
+        from spidy import agent, llm
+        replies = ["Use httpx", '{"action":"run","tool":"httpx"}', llm.LLMError("guide offline"),
+                   '{"action":"run","command":"printf evidence","reason":"local review"}']
+        with patch("spidy.agent.llm.generate", side_effect=replies):
+            p = agent.propose_next(self.store.get(self.scan["id"]), "executor", None,
+                                   [{"tool": "httpx", "outcome": "ran"}], guide_model="guide")
+        self.assertEqual(p["command"], "printf evidence")
+        self.assertEqual(p["planning_attempts"][1]["issue"], "guide offline")
+
+    def test_runaway_guide_does_not_poison_executor_retry(self):
+        from spidy import agent, llm
+        replies = ["Review saved work", '{"action":"run","tool":"ffuf"}',
+                   llm.GenerationRejected("Model output repeated the same sequence eight times. Runaway output was stopped and discarded."),
+                   '{"action":"run","command":"printf reviewed","reason":"local review"}']
+        with patch("spidy.agent.llm.generate", side_effect=replies) as generate, patch("spidy.agent._run_command") as run:
+            p = agent.propose_next(self.store.get(self.scan["id"]), "executor", None,
+                                   [{"tool":"ffuf","outcome":"ran"}], guide_model="guide")
+        self.assertEqual(p["command"], "printf reviewed")
+        self.assertIn("Runaway output", generate.call_args.args[1])
+        self.assertNotIn("partial output", p["command"])
+        self.assertTrue(p["planning_attempts"][1]["proposal"]["generation_rejected"])
+        run.assert_not_called()
+
+    def test_runaway_models_stop_without_queuing_a_draft(self):
+        from spidy import agent, llm
+        history = [{"tool":name,"outcome":"ran"} for name in agent.externals.TOOLS]
+        with patch("spidy.agent.llm.generate", side_effect=llm.GenerationRejected("Runaway output was discarded")) as generate:
+            p = agent.propose_next(self.store.get(self.scan["id"]), "executor", None, history, guide_model="guide")
+        self.assertEqual(p["action"], "paused")
+        self.assertNotIn("command", p)
+        self.assertEqual(generate.call_count, agent.MAX_PROPOSAL_ATTEMPTS + 2)
+
+    def test_guide_can_prepare_a_command_after_executor_defers_to_manual(self):
+        from spidy import agent
+        replies = ["Review local tool startup", '{"action":"manual","instructions":"Check curl version","reason":"Check local availability"}',
+                   '{"action":"run","command":"curl --version","reason":"Check local availability"}']
+        with patch("spidy.agent.llm.generate", side_effect=replies) as generate, patch("spidy.agent._run_command") as run:
+            p = agent.propose_next(self.store.get(self.scan["id"]), "executor", None, [], guide_model="guide")
+        self.assertEqual(p["source"], "guide_repair")
+        self.assertEqual(p["command"], "curl --version")
+        self.assertIn("deferred to manual", generate.call_args.args[1])
+        run.assert_not_called()
+
+    def test_operator_context_reaches_guide_executor_and_correction_round(self):
+        from spidy import agent
+        replies = ["Review the recorded headers", '{"action":"run","tool":"ffuf","options":{}}',
+                   '{"action":"manual","instructions":"Review owner configuration","reason":"Need owner access"}']
+        events = []
+        with patch("spidy.agent.llm.generate", side_effect=replies) as generate, patch("spidy.agent._run_command") as run:
+            proposal = agent.propose_next(self.store.get(self.scan["id"]), "executor", None,
+                [{"tool": "ffuf", "outcome": "ran"}], guide_model="guide",
+                guide_context="Focus on cookie configuration; the deployment changed yesterday.",
+                progress=lambda field, value: events.append((field, value)))
+        self.assertEqual(generate.call_count, 3)
+        for call in generate.call_args_list:
+            self.assertIn("the deployment changed yesterday", call.args[1])
+        self.assertEqual([entry["role"] for entry in proposal["discussion"]],
+                         ["user", "guide", "executor", "checks", "guide"])
+        self.assertEqual(proposal["discussion"][1]["model"], "guide")
+        self.assertTrue(any(field == "discussion" for field, _ in events))
+        run.assert_not_called()
+
+    def test_guide_context_is_saved_reused_and_can_be_cleared(self):
+        from spidy import agent
+        body = {"action": "plan", "model": "local", "guide_context": "Check the saved cookie evidence."}
+        with patch("spidy.agent.llm.generate", return_value='{"action":"done","reason":"Review"}') as generate:
+            agent.autopilot_action(self.store, self.scan["id"], body)
+            self.assertEqual(self.store.get(self.scan["id"])["autopilot"]["guide_context"], body["guide_context"])
+            agent.autopilot_action(self.store, self.scan["id"], {"action": "plan"})
+            self.assertIn(body["guide_context"], generate.call_args.args[1])
+            agent.autopilot_action(self.store, self.scan["id"], {"action": "plan", "guide_context": ""})
+            self.assertEqual(self.store.get(self.scan["id"])["autopilot"]["guide_context"], "")
+            self.assertNotIn(body["guide_context"], generate.call_args.args[1])
+        for invalid in (None, {}, "x" * 4001, "bad\x00context"):
+            with self.assertRaisesRegex(ValueError, "4,000"):
+                agent.autopilot_action(self.store, self.scan["id"], {"action": "plan", "guide_context": invalid})
+
+    def test_manual_access_followup_survives_unusable_guide_replacements(self):
+        from spidy import agent
+        history = [{"tool": name, "outcome": "ran"} for name in agent.externals.TOOLS]
+        manual = {"action": "manual", "instructions": "Request owner access to the WAF configuration.",
+                  "reason": "The configuration is not publicly available."}
+        replies = ["Review the saved results", json.dumps(manual)] + ['{"action":"run","tool":"ffuf","options":{}}'] * 3
+        with patch("spidy.agent.llm.generate", side_effect=replies) as generate, patch("spidy.agent._run_command") as run:
+            proposal = agent.propose_next(self.store.get(self.scan["id"]), "executor", None, history, guide_model="guide")
+        self.assertEqual(proposal["action"], "manual")
+        self.assertEqual(proposal["instructions"], manual["instructions"])
+        self.assertEqual(proposal["source"], "manual_followup")
+        self.assertNotIn("command", proposal)
+        self.assertIn(manual["instructions"], generate.call_args_list[2].args[1])
+        self.assertEqual(len(proposal["rejected_repeats"]), 3)
+        run.assert_not_called()
+
+    def test_header_probe_does_not_treat_a_missing_header_as_execution_failure(self):
+        from spidy import agent
+        p, issue = agent._normalize_reply(json.dumps({"action": "run", "command": "curl -s -I https://t.test/ | grep -i 'Content-Security-Policy'"}))
+        self.assertIsNone(issue)
+        self.assertEqual(p["command"], "curl --silent --show-error --max-time 20 --head -- https://t.test/")
+        self.assertIn("missing header is evidence", p["preparation_note"])
+        # Custom request semantics and additional shell commands must never be discarded.
+        for command in ["curl -X POST https://t.test/ | grep -i Content-Security-Policy",
+                        "curl -I -H 'Cookie: session=example' https://t.test/ | grep -i Content-Security-Policy",
+                        "curl -s -I https://t.test/ | grep -i Content-Security-Policy; printf next",
+                        "curl -I https://t.test/ | grep -i 'Content-Security-Policy.*'"]:
+            self.assertIsNone(agent._prepare_header_probe(command))
+
+    def test_successful_repair_retires_stale_failure_advice(self):
+        from spidy import agent
+        history = [{"command": "nikto -z https://t.test/", "outcome": "failed"},
+                   {"tool": "nikto", "outcome": "ran"}]
+        self.assertEqual(agent._failed_commands(history), [])
+        history.append({"tool": "nikto", "outcome": "failed", "error": "new failure"})
+        failures = agent._failed_commands(history)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("new failure", failures[0])
+
+    def test_exhausted_scans_switch_to_findings_instead_of_old_command_examples(self):
+        from spidy import agent
+        history = [{"tool": name, "outcome": "ran"} for name in agent.externals.TOOLS]
+        history.append({"command": "nikto -z https://t.test/", "outcome": "failed"})
+        scan = self.store.get(self.scan["id"])
+        scan["findings"] = [{"id": "f-1", "title": "Cookie attributes need review", "url": "https://t.test/", "severity": "low", "confidence": "high",
+                             "evidence": "cookie lacks Secure", "description": "Cookie requires review", "remediation": "Review cookie settings",
+                             "verification": "Determine whether this cookie is used for authentication"}]
+        with patch("spidy.agent.llm.generate", return_value='{"action":"manual","instructions":"Identify which cookie is a session cookie with the owner","reason":"Assess cookie risk"}') as generate:
+            proposal = agent.propose_next(scan, "executor", None, history, guide_model="guide")
+        self.assertEqual(proposal["action"], "manual")
+        for call in generate.call_args_list:
+            self.assertIn("Cookie attributes need review", call.args[1])
+            self.assertIn("no unused built-in fallback", call.args[1])
+            self.assertNotIn("nikto -z", call.args[1])
+            self.assertNotIn("default options", call.args[1])
+
+    def test_compact_planning_keeps_custom_targets_and_observed_header_results(self):
+        from spidy import agent
+        history = [{"tool": name, "outcome": "ran"} for name in agent.externals.TOOLS]
+        history += [
+            {"command":"curl --head https://t.test/", "outcome":"ran", "meta":{"exit_code":0,
+              "output":"HTTP/2 200\r\nserver: local\r\nset-cookie: secret=private-value;Secure;Path=/\r\n\r\n"}},
+            {"command":"curl --head https://t.test/.env.local", "outcome":"ran", "meta":{"exit_code":0,
+              "output":"HTTP/2 403\r\nserver: local\r\n\r\n"}}]
+        scan = self.store.get(self.scan["id"])
+        with patch("spidy.agent.llm.generate", return_value='{"action":"done","reason":"Review saved results"}') as generate:
+            agent.propose_next(scan, "executor", None, history, guide_model="guide")
+        for call in generate.call_args_list:
+            prompt = call.args[1]
+            self.assertIn('"http_status": 200', prompt)
+            self.assertIn('"http_status": 403', prompt)
+            self.assertIn('https://t.test/.env.local', prompt)
+            self.assertIn('No enforced Content-Security-Policy', prompt)
+            self.assertIn('Secure;Path=/', prompt)
+            self.assertNotIn('private-value', prompt)
+            self.assertIn('not proof a sensitive file was exposed', prompt)
+
+    def test_truncated_capture_does_not_assert_header_absence(self):
+        from spidy import agent
+        rows = [{"command":"curl --head https://t.test/", "outcome":"ran",
+                 "meta":{"exit_code":0,"output":"HTTP/2 200\r\nserver: local", "output_truncated":True}}]
+        result = agent._followup_evidence(rows)[0]
+        self.assertFalse(result["headers_complete"])
+        self.assertNotIn("observation", result)
+
+    def test_manual_scan_after_planning_blocks_execution(self):
+        proposal = self.plan({"action": "run", "tool": "httpx"})
+        self.store.append(self.scan["id"], "events", {"type": "deep_scan", "tool": "httpx",
+                          "target": "https://t.test/", "options": {}})
+        with patch("spidy.externals.run_tool") as execute:
+            with self.assertRaisesRegex(ValueError, "manual event"):
+                self.decide(proposal, approved=True)
+        execute.assert_not_called()
+
+    def test_manual_options_are_respected_and_unknown_legacy_options_not_invented(self):
+        from spidy.action_memory import recorded_actions, repeated_steps
+        scan = self.store.get(self.scan["id"])
+        scan["events"] = [{"type": "deep_scan", "tool": "katana", "target": scan["config"]["target"]}]
+        self.assertEqual(repeated_steps({"tool": "katana"}, recorded_actions(scan), scan["config"]["target"]), [])
+        scan["events"][0]["options"] = {"depth": "2"}
+        self.assertEqual(repeated_steps({"tool": "katana"}, recorded_actions(scan), scan["config"]["target"]), ["manual event 1"])
+        self.assertEqual(repeated_steps({"tool": "katana", "options": {"depth": "3"}}, recorded_actions(scan), scan["config"]["target"]), [])
+
+    def test_main_scan_tools_are_recorded_only_when_attempted(self):
+        from spidy.action_memory import recorded_actions, repeated_steps
+        scan = self.store.get(self.scan["id"])
+        scan["events"] = [{"type": "check_skipped", "check": "waf"},
+                          {"type": "nuclei_summary", "timed_out": False}]
+        self.assertEqual(repeated_steps({"tool": "wafw00f"}, recorded_actions(scan), scan["config"]["target"]), [])
+        self.assertEqual(repeated_steps({"tool": "nuclei"}, recorded_actions(scan), scan["config"]["target"]), ["main scan event 2"])
+
+    def test_equivalent_custom_command_and_adapter_share_memory(self):
+        from spidy.action_memory import repeated_steps
+        history = [{"command": "wafw00f https://t.test/", "outcome": "ran"}]
+        self.assertEqual(repeated_steps({"tool": "wafw00f"}, history, "https://t.test/"), [1])
+        self.assertEqual(repeated_steps({"tool": "wafw00f"}, history, "https://different.test/"), [])
+
+    def test_auto_approval_is_audited_and_still_single_use(self):
+        proposal = self.plan({"action": "run", "command": "printf test"})
+        with patch("spidy.agent._run_command", return_value={"exit_code": 0}) as execute:
+            self.decide(proposal, approved=True, command="printf test", approval_mode="automatic")
+            with self.assertRaisesRegex(ValueError, "no longer pending"):
+                self.decide(proposal, approved=True, command="printf test", approval_mode="automatic")
+        execute.assert_called_once()
+        self.assertEqual(self.store.get(self.scan["id"])["autopilot"]["steps"][0]["approval_mode"], "automatic")
 
     def test_bare_reason_key_is_recovered_without_changing_command(self):
         from spidy import agent
@@ -745,8 +987,9 @@ class AutopilotTests(unittest.TestCase):
 
     def test_repeated_proposals_pause_after_bounded_attempts(self):
         from spidy import agent
-        history = [{"outcome": "ran", "tool": "nuclei", "options": {"tags": "none"}, "added": 0}]
-        with patch("spidy.agent.llm.generate", return_value='{"action":"run","tool":"nuclei","options":{"tags":"none"}}') as generate:
+        history = [{"outcome": "ran", "tool": "nuclei", "options": {"tags": "misconfig"}, "added": 0}]
+        history += [{"outcome": "ran", "tool": name} for name in agent.externals.TOOLS if name != "nuclei"]
+        with patch("spidy.agent.llm.generate", return_value='{"action":"run","tool":"nuclei","options":{"tags":"misconfig"}}') as generate:
             proposal = agent.propose_next(self.store.get(self.scan["id"]), "local", None, history)
         self.assertEqual(proposal["action"], "paused")
         self.assertEqual(generate.call_count, agent.MAX_PROPOSAL_ATTEMPTS)
@@ -774,15 +1017,62 @@ class AutopilotTests(unittest.TestCase):
             proposal = agent.propose_next(self.store.get(self.scan["id"]), "local", None, history)
         self.assertEqual(proposal["action"], "paused")
 
-    def test_duplicate_followed_by_broken_command_pauses_without_queueing_it(self):
+    def test_duplicate_followed_by_broken_command_selects_ready_fallback(self):
         from spidy import agent
         history = [{"outcome": "ran", "command": "printf test"}]
         bad = json.dumps({"action": "run", "command": "ffuf --exts=.html --reason:review site's files"})
         replies = ['{"action":"run","command":"printf test"}', bad, bad]
         with patch("spidy.agent.llm.generate", side_effect=replies):
             proposal = agent.propose_next(self.store.get(self.scan["id"]), "local", None, history)
-        self.assertEqual(proposal["action"], "paused")
+        self.assertEqual(proposal["action"], "run")
+        self.assertEqual(proposal["source"], "validated_fallback")
         self.assertNotIn("command", proposal)
+
+    def test_missing_dependency_diagnosis_does_not_recommend_scan_flags(self):
+        from spidy import agent
+        step = {"outcome": "failed", "command": "nikto -host https://t.test/",
+                "meta": {"exit_code": 1, "output": "ERROR: Required module not found: XML::Writer"}}
+        directive = agent._repair_directive([step])
+        self.assertIn("Missing local dependency", directive)
+        self.assertNotIn("Correct usage", directive)
+        self.assertNotIn("Simplest reliable fix", directive)
+        failures = "\n".join(agent._failed_commands([step]))
+        self.assertIn("XML::Writer", failures)
+        self.assertNotIn("correct usage", failures)
+        proposal, issue = agent._normalize_reply('{"action":"run","command":"nikto -Version"}')
+        self.assertIsNone(issue)
+        self.assertEqual(proposal["command"], "nikto -Version", "local startup checks must not become target scans")
+
+    def test_blocked_tool_is_replaced_with_ready_untried_fallback(self):
+        from spidy import agent
+        def readiness(name):
+            return {"ready": name == "gau", "error": "Missing XML::Writer" if name == "nikto" else "not installed"}
+        with patch("spidy.externals.tool_readiness", side_effect=readiness), \
+                patch("spidy.agent.llm.generate", return_value='{"action":"run","tool":"nikto"}') as generate:
+            proposal = agent.propose_next(self.store.get(self.scan["id"]), "local", None, [])
+        self.assertEqual(proposal["tool"], "gau")
+        self.assertEqual(proposal["source"], "validated_fallback")
+        self.assertEqual(generate.call_count, agent.MAX_PROPOSAL_ATTEMPTS)
+        self.assertIn("Missing XML::Writer", generate.call_args.args[1])
+
+    def test_placeholder_nuclei_tags_cannot_be_queued_or_executed(self):
+        from spidy import agent, externals
+        history = [{"outcome": "ran", "tool": name} for name in externals.TOOLS if name != "gau"]
+        with patch("spidy.agent.llm.generate", return_value='{"action":"run","tool":"nuclei","options":{"tags":"none"}}'):
+            proposal = agent.propose_next(self.store.get(self.scan["id"]), "local", None, history)
+        self.assertEqual(proposal["tool"], "gau")
+        self.assertIn("literal tag", proposal["rejected_invalid"][0])
+        valid = self.plan({"action": "run", "tool": "nuclei", "options": {"tags": ""}})
+        with patch("spidy.externals.run_tool") as run:
+            with self.assertRaisesRegex(externals.ToolError, "literal tag"):
+                self.decide(valid, approved=True, options={"tags": "none"})
+        run.assert_not_called()
+
+    def test_fallback_does_not_rerun_completed_or_declined_tools(self):
+        from spidy import agent
+        readiness = {name: {"ready": True} for name in agent.externals.TOOLS}
+        history = [{"outcome": "skipped", "tool": name} for name in agent.externals.TOOLS]
+        self.assertEqual(agent._ready_candidates(self.store.get(self.scan["id"]), history, readiness), [])
 
     def test_ffuf_reordering_and_rate_changes_do_not_repeat_same_work(self):
         from spidy.action_memory import repeated_steps
@@ -793,6 +1083,28 @@ class AutopilotTests(unittest.TestCase):
         self.assertEqual(repeated_steps(proposal, history, "https://t.test/"), [])
         proposal["command"] = "ffuf -u https://other.test/FUZZ -e .html,.css -w /tmp/words"
         self.assertEqual(repeated_steps(proposal, history, "https://t.test/"), [])
+
+    def test_curl_presentation_flags_do_not_evade_completed_header_request(self):
+        from spidy.action_memory import repeated_steps
+        history = [{"outcome":"ran", "command":"curl --silent --show-error --max-time 20 --head -- https://t.test/.env.local"}]
+        for command in ("curl -s -I https://t.test/.env.local", "curl -IsS --max-time=30 https://t.test/.env.local",
+                        "curl --url https://t.test/.env.local --head", "/usr/bin/curl -I -m10 https://t.test/.env.local"):
+            self.assertEqual(repeated_steps({"command":command}, history, "https://t.test/"), [1])
+        for command in ("curl -s https://t.test/.env.local", "curl -I https://t.test/other", "curl -IL https://t.test/.env.local",
+                        "curl -I -H 'Accept: application/json' https://t.test/.env.local",
+                        "curl -I https://t.test/.env.local > saved-headers.txt"):
+            self.assertEqual(repeated_steps({"command":command}, history, "https://t.test/"), [])
+
+    def test_automatic_approval_cannot_run_shortened_completed_curl_command(self):
+        from spidy import agent
+        p = self.plan({"action":"run", "command":"curl -s -I https://t.test/"})
+        state = self.store.get(self.scan["id"])["autopilot"]
+        state["steps"].append({"outcome":"ran", "command":"curl --silent --show-error --max-time 20 --head -- https://t.test/"})
+        self.store.update(self.scan["id"], autopilot=state)
+        with patch("spidy.agent._run_command") as run:
+            with self.assertRaisesRegex(ValueError, "already attempted"):
+                self.decide(p, approved=True, command=p["command"], approval_mode="automatic")
+        run.assert_not_called()
 
     def test_duplicates_include_skips_failures_and_default_builtin_options(self):
         from spidy.action_memory import repeated_steps
@@ -897,18 +1209,20 @@ class AutopilotTests(unittest.TestCase):
         from spidy import agent, llm
         reply = '{"action":"run","command":"custom-tool --inspect https://t.test/"}'
         with patch("spidy.llm._request", return_value={"response": reply}) as request, \
+                patch("spidy.llm._generate_stream", return_value=reply) as stream, \
                 patch("spidy.agent._run_command") as command, patch("spidy.externals.run_tool") as tool:
             proposal = agent.propose_next(self.store.get(self.scan["id"]), "local", None, [])
             analysis = llm.analyze_scan(self.store.get(self.scan["id"]), "local")
         self.assertEqual(proposal["command"], "custom-tool --inspect https://t.test/")
         self.assertEqual(analysis["text"], reply)
-        self.assertEqual(request.call_count, 2)
-        self.assertEqual(request.call_args_list[0].args[2]["format"], agent.PROPOSAL_SCHEMA)
-        self.assertNotIn("format", request.call_args_list[1].args[2])
-        for call in request.call_args_list:
-            payload = call.args[2]
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(stream.call_args.args[1]["format"], agent.PROPOSAL_SCHEMA)
+        self.assertTrue(stream.call_args.args[1]["stream"])
+        self.assertIs(stream.call_args.args[3], agent._guard_proposal_output)
+        self.assertNotIn("format", request.call_args.args[2])
+        self.assertFalse(request.call_args.args[2]["stream"])
+        for payload in (stream.call_args.args[1], request.call_args.args[2]):
             self.assertIn(llm.PROPOSAL_RULES, payload["system"])
-            self.assertFalse(payload["stream"])
             self.assertEqual(payload["options"]["num_ctx"], 16384)
         command.assert_not_called()
         tool.assert_not_called()
@@ -1011,12 +1325,13 @@ class AutopilotTests(unittest.TestCase):
 
     def test_recent_results_and_skips_are_in_model_context(self):
         from spidy import agent
-        history = [{"outcome": "ran", "command": "printf first", "meta": {"output": "some evidence", "exit_code": 0}},
+        history = [{"outcome": "ran", "command": "printf first", "meta": {"output": "some evidence", "output_tail": "UI_ONLY_TAIL", "exit_code": 0}},
                    {"outcome": "skipped", "tool": "httpx", "options": {"foo": "bar"}}]
         with patch("spidy.agent.llm.generate", return_value='{"action":"done","reason":"enough"}') as generate:
             agent.propose_next(self.store.get(self.scan["id"]), "local", None, history)
         prompt = generate.call_args.args[1]
         self.assertIn("some evidence", prompt)
+        self.assertNotIn("UI_ONLY_TAIL", prompt)
         self.assertIn('"skipped"', prompt)
         self.assertIn("not a limit on proposals", prompt)
 
